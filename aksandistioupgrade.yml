@@ -1,0 +1,143 @@
+trigger:
+- main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  RESOURCE_GROUP: '<ResourceGroupName>'
+  AKS_CLUSTER_NAME: '<AKSClusterName>'
+  NODE_POOL_NAME: '<NodePoolName>'
+  NEW_K8S_VERSION: '<NewKubernetesVersion>'
+  ISTIO_VERSION: '<NewIstioVersion>'
+  K8S_NAMESPACE: '<Namespace>'
+  APP_NAME: '<AppName>'
+  PDB_NAME: '<PdbName>'
+  ISTIO_NAMESPACE: 'istio-system'
+
+stages:
+- stage: UpgradeAKS
+  displayName: Upgrade AKS Cluster
+  jobs:
+  - job: UpgradeControlPlane
+    displayName: Upgrade AKS Control Plane
+    steps:
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: '<AzureServiceConnection>'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          echo "Upgrading AKS Control Plane to version $NEW_K8S_VERSION"
+          az aks upgrade --resource-group $RESOURCE_GROUP --name $AKS_CLUSTER_NAME --kubernetes-version $NEW_K8S_VERSION --yes
+
+  - job: UpgradeNodePool
+    displayName: Upgrade AKS Node Pool
+    dependsOn: UpgradeControlPlane
+    steps:
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: '<AzureServiceConnection>'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          echo "Draining nodes in node pool $NODE_POOL_NAME"
+          NODE_IDS=$(az aks nodepool list --resource-group $RESOURCE_GROUP --cluster-name $AKS_CLUSTER_NAME --query "[?name=='$NODE_POOL_NAME'].id" -o tsv)
+          for NODE_ID in $NODE_IDS; do
+            kubectl drain $NODE_ID --ignore-daemonsets --delete-local-data --force
+          done
+          echo "Upgrading Node Pool $NODE_POOL_NAME to version $NEW_K8S_VERSION"
+          az aks nodepool upgrade --resource-group $RESOURCE_GROUP --cluster-name $AKS_CLUSTER_NAME --name $NODE_POOL_NAME --kubernetes-version $NEW_K8S_VERSION --yes
+          for NODE_ID in $NODE_IDS; do
+            kubectl uncordon $NODE_ID
+          done
+
+- stage: UpgradeIstio
+  displayName: Upgrade Istio
+  dependsOn: UpgradeAKS
+  jobs:
+  - job: UpgradeIstio
+    displayName: Upgrade Istio to Version $(ISTIO_VERSION)
+    steps:
+    - task: Kubernetes@1
+      inputs:
+        kubernetesServiceEndpoint: '<KubernetesServiceConnection>'
+        namespace: $(ISTIO_NAMESPACE)
+        command: apply
+        useConfigurationFile: false
+        configuration: |
+          curl -L https://istio.io/downloadIstio | ISTIO_VERSION=$(ISTIO_VERSION) sh -
+          cd istio-$(ISTIO_VERSION)
+          export PATH=$PWD/bin:$PATH
+          istioctl install --set profile=default -y
+          kubectl label namespace $(K8S_NAMESPACE) istio-injection=enabled --overwrite
+          kubectl rollout restart deployment -n $(ISTIO_NAMESPACE)
+          cd ..
+
+- stage: DeployApp
+  displayName: Deploy Application
+  dependsOn: UpgradeIstio
+  jobs:
+  - job: Deploy
+    displayName: Deploy Application with PDB and Monitor Resource Usage
+    steps:
+    - task: Kubernetes@1
+      inputs:
+        kubernetesServiceEndpoint: '<KubernetesServiceConnection>'
+        namespace: $(K8S_NAMESPACE)
+        command: apply
+        useConfigurationFile: true
+        configuration: |
+          apiVersion: policy/v1
+          kind: PodDisruptionBudget
+          metadata:
+            name: $(PDB_NAME)
+          spec:
+            minAvailable: 2
+            selector:
+              matchLabels:
+                app: $(APP_NAME)
+
+    - task: Kubernetes@1
+      inputs:
+        kubernetesServiceEndpoint: '<KubernetesServiceConnection>'
+        namespace: $(K8S_NAMESPACE)
+        command: apply
+        useConfigurationFile: true
+        configuration: |
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: $(APP_NAME)
+          spec:
+            replicas: 3
+            strategy:
+              type: RollingUpdate
+              rollingUpdate:
+                maxUnavailable: 1
+                maxSurge: 1
+            template:
+              metadata:
+                labels:
+                  app: $(APP_NAME)
+              spec:
+                containers:
+                - name: $(APP_NAME)-container
+                  image: $(DOCKER_IMAGE):$(IMAGE_TAG)
+
+    - task: Kubernetes@1
+      inputs:
+        kubernetesServiceEndpoint: '<KubernetesServiceConnection>'
+        namespace: $(K8S_NAMESPACE)
+        command: rollout status
+        arguments: deployment/$(APP_NAME)
+
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: '<AzureServiceConnection>'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          echo "Monitoring resource usage"
+          kubectl top nodes
+          kubectl top pods --namespace $(K8S_NAMESPACE)
